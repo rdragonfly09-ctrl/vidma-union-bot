@@ -1,95 +1,132 @@
 import os
-import hmac
-import hashlib
-import json
-import typing as t
-
 import requests
 from fastapi import FastAPI, Request, HTTPException, Header
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-BASE_URL = os.environ["BASE_URL"].rstrip("/")          # наприклад: https://vidma-union-bot.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")       # необов'язково
-ADMIN_ID = os.getenv("ADMIN_ID")                       # необов'язково
+BASE_URL = os.environ["BASE_URL"].rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+ADMIN_ID = os.getenv("ADMIN_ID")  # наприклад 6958136111
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+app = FastAPI(title="Vidma Assistant")
 
-app = FastAPI(title="Telegram Bot (FastAPI+requests)")
+# ---------- helpers ----------
+def send(method: str, payload: dict):
+    requests.post(f"{API}/{method}", json=payload, timeout=15)
 
-def tg_send_chat_action(chat_id: int, action: str = "typing") -> None:
-    try:
-        requests.post(f"{TELEGRAM_API}/sendChatAction", json={"chat_id": chat_id, "action": action}, timeout=10)
-    except Exception:
-        pass
+def chat_action(chat_id: int, action="typing"):
+    send("sendChatAction", {"chat_id": chat_id, "action": action})
 
-def tg_send_message(chat_id: int, text: str, disable_web_page_preview: bool = True) -> None:
-    payload = {
+def kb_main():
+    return {
+        "keyboard": [
+            [{"text": "📝 Подати заявку"}],
+            [{"text": "🔮 Діагностика (опис)"}],
+            [{"text": "🕯 Підтримка"}],
+            [{"text": "⬅️ Меню"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+def reply(chat_id: int, text: str):
+    send("sendMessage", {
         "chat_id": chat_id,
         "text": text,
-        "disable_web_page_preview": disable_web_page_preview,
         "parse_mode": "HTML",
-    }
-    requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=15)
+        "disable_web_page_preview": True,
+        "reply_markup": kb_main()
+    })
 
-def set_webhook(url: str) -> bool:
+def set_webhook(url: str):
     payload = {"url": url}
     if WEBHOOK_SECRET:
         payload["secret_token"] = WEBHOOK_SECRET
-    r = requests.post(f"{TELEGRAM_API}/setWebhook", json=payload, timeout=15)
+    r = requests.post(f"{API}/setWebhook", json=payload, timeout=15)
     try:
-        data = r.json()
+        return r.json().get("ok", False)
     except Exception:
         return False
-    return bool(data.get("ok"))
 
 @app.on_event("startup")
 def on_startup():
-    # реєструємо вебхук
-    wh_url = f"{BASE_URL}/webhook/{BOT_TOKEN}"
-    ok = set_webhook(wh_url)
-    if not ok:
-        print("Failed to set webhook. Check BASE_URL and token.")
+    wh = f"{BASE_URL}/webhook/{BOT_TOKEN}"
+    if set_webhook(wh):
+        print("Webhook set:", wh)
     else:
-        print(f"Webhook set to {wh_url}")
+        print("Failed to set webhook")
 
-def verify_secret(header_token: t.Optional[str]) -> None:
+def verify_secret(header_token):
     if not WEBHOOK_SECRET:
         return
-    if not header_token or header_token != WEBHOOK_SECRET:
+    if header_token != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret token")
 
+# ---------- handlers ----------
 @app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request, x_telegram_bot_api_secret_token: t.Optional[str] = Header(None)):
-    # 1) токен у шляху має збігатися (проста перевірка адреси вебхука)
+async def webhook(token: str, request: Request,
+                  x_telegram_bot_api_secret_token: str | None = Header(None)):
     if token != BOT_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid path token")
-
-    # 2) (опційно) перевіряємо секретний заголовок від Telegram
+        raise HTTPException(status_code=403, detail="Bad token")
     verify_secret(x_telegram_bot_api_secret_token)
 
-    update = await request.json()
-
-    # Підтримка повідомлень
-    if "message" in update:
-        msg = update["message"]
+    upd = await request.json()
+    if "message" in upd:
+        msg = upd["message"]
         chat_id = msg["chat"]["id"]
-        text = msg.get("text", "") or ""
+        text = (msg.get("text") or "").strip()
+        username = msg["from"].get("username", "")
+        name = (msg["from"].get("first_name","") + " " + msg["from"].get("last_name","")).strip()
 
-        tg_send_chat_action(chat_id)
+        chat_action(chat_id)
 
-        if text.startswith("/start"):
-            tg_send_message(chat_id,
-                "Вітаю! Я асистент. Надішли мені будь-який текст — я відповім.\n"
-                "Щоб змінити текст — просто напиши нове повідомлення."
+        low = text.lower()
+
+        if text.startswith("/start") or low == "⬅️ меню":
+            reply(chat_id,
+                  "Вітаю! Я асистент.\n\n"
+                  "Обери дію нижче або просто напиши повідомлення — я передам його майстру.")
+            return {"ok": True}
+
+        if "подати заявку" in low:
+            reply(chat_id,
+                  "📝 <b>Подати заявку</b>\n\n"
+                  "Напиши одним повідомленням:\n"
+                  "• Ім’я\n"
+                  "• @нік або посилання на профіль/канал\n"
+                  "• Що потрібно (діагностика/навчання/інше)\n"
+                  "• Короткий опис запиту.\n\n"
+                  "Після надсилання я передам заявку та повернуся з відповіддю.")
+            return {"ok": True}
+
+        if "діагностика (опис)" in low:
+            reply(chat_id,
+                  "🔮 <b>Діагностика — як це працює</b>\n\n"
+                  "• Я збираю запит і передаю майстру.\n"
+                  "• Після підтвердження — оплата і час виконання.\n"
+                  "• Результат ви отримуєте у форматі голосового/тексту.\n\n"
+                  "Хочеш оформити запит — натисни «📝 Подати заявку».")
+            return {"ok": True}
+
+        if "підтримка" in low:
+            reply(chat_id,
+                  "🕯 <b>Підтримка</b>\n\n"
+                  "Питання щодо навчання, діагностики, оплати й термінів — пиши тут. "
+                  "Я передам повідомлення та поверну відповідь якнайшвидше.")
+            return {"ok": True}
+
+        # УСЕ ІНШЕ — вважаємо зверненням/заявкою та пересилаємо адміну
+        if ADMIN_ID:
+            info = (
+                "📩 <b>Нове звернення</b>\n"
+                f"• user: @{username or '—'} ({name or '—'})\n"
+                f"• chat_id: <code>{chat_id}</code>\n"
+                f"• text:\n{text}"
             )
-        else:
-            reply = f"Ти написала: <b>{text}</b>\nЯ працюю на Render без aiohttp 😉"
-            tg_send_message(chat_id, reply)
+            send("sendMessage", {"chat_id": int(ADMIN_ID), "text": info, "parse_mode": "HTML"})
 
-    # Можна додати інші типи оновлень (callback_query, my_chat_member тощо)
-
+        reply(chat_id, "Дякую! Заявку/повідомлення надіслано. Очікуйте відповіді 🕯")
     return {"ok": True}
 
 @app.get("/")
 def root():
-    return {"status": "ok", "webhook": f"{BASE_URL}/webhook/{BOT_TOKEN}"}
+    return {"status": "ok"}
